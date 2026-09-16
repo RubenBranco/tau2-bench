@@ -436,7 +436,8 @@ class Orchestrator(BaseOrchestrator[AgentT, UserT, Message]):
             - User sends stop signal
             - Maximum steps (max_steps) reached
             - Maximum errors (max_errors) reached
-            - Communication protocol violation detected (if validate_communication=True)
+            - Agent breaks the message content rules, or sends text to the user in solo mode
+            - Any other communication protocol violation detected (if validate_communication=True)
     """
 
     def __init__(
@@ -952,6 +953,13 @@ class Orchestrator(BaseOrchestrator[AgentT, UserT, Message]):
         Sends self.message from self.from_role to self.to_role.
         This can either be a message from agent to user/environment, environment to agent,
         or user to agent. Updates self.trajectory.
+
+        A model-output failure on the agent's turn (an empty message, malformed tool call
+        arguments) ends the simulation with AGENT_ERROR, which scores the task 0, unless the
+        provider labelled the turn a fault of its own (see RETRYABLE_FINISH_REASONS). The same
+        failure on the user's turn is left to propagate so the caller retries the episode: the
+        user simulator is measurement apparatus rather than the system under test, so its
+        failures must not be charged to the agent.
         """
         if self.done:
             raise ValueError("Simulation is done")
