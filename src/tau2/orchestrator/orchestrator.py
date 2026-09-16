@@ -862,7 +862,24 @@ class Orchestrator(BaseOrchestrator[AgentT, UserT, Message]):
             agent_msg, self.agent_state = self.agent.generate_next_message(
                 self.message, self.agent_state
             )
-            agent_msg.validate()
+            try:
+                agent_msg.validate()
+            except ValueError as exc:
+                # An agent turn with neither content nor a tool call is an agent failure, not an
+                # infrastructure fault: end the episode here so it scores 0. Without this the
+                # ValueError escapes to run_with_retry(), which re-runs the whole episode and
+                # hands the model a fresh draw.
+                logger.warning(f"Agent sent an empty message, ending simulation: {exc}")
+                self.trajectory.append(agent_msg)
+                self.message = agent_msg
+                self.from_role = Role.AGENT
+                self.to_role = Role.USER
+                self.done = True
+                self.termination_reason = TerminationReason.AGENT_ERROR
+                # step_count is left untouched on purpose: run() calls _check_termination() even
+                # once step() has set done, and one more step would relabel this AGENT_ERROR as
+                # MAX_STEPS on the last allowed step.
+                return
             if self.agent.is_stop(agent_msg):
                 self.done = True
                 self.termination_reason = TerminationReason.AGENT_STOP

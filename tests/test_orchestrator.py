@@ -486,6 +486,110 @@ def test_validate_communication_catches_mixed_message(
     assert orchestrator.termination_reason == TerminationReason.AGENT_ERROR
 
 
+def test_empty_agent_message_terminates_with_agent_error(
+    domain_name: str,
+    user_simulator: UserSimulator,
+    agent: LLMAgent,
+    base_task: Task,
+    get_environment: Callable[[], Environment],
+):
+    """Test that an empty agent message ends the simulation instead of raising."""
+    from tau2.data_model.simulation import TerminationReason
+
+    orchestrator = Orchestrator(
+        domain=domain_name,
+        user=user_simulator,
+        agent=agent,
+        environment=get_environment(),
+        task=base_task,
+    )
+    orchestrator.initialize()
+
+    empty_message = AssistantMessage(role="assistant", content=None, cost=0.0)
+    orchestrator.agent.generate_next_message = lambda message, state: (
+        empty_message,
+        state,
+    )
+    # Hand the turn to the agent.
+    orchestrator.from_role = Role.USER
+    orchestrator.to_role = Role.AGENT
+
+    orchestrator.step()  # Must not raise.
+
+    assert orchestrator.done is True
+    assert orchestrator.termination_reason == TerminationReason.AGENT_ERROR
+    assert orchestrator.from_role == Role.AGENT
+    assert orchestrator.to_role == Role.USER
+    assert orchestrator.message is empty_message
+    assert orchestrator.get_trajectory()[-1].content is None
+
+
+def test_empty_agent_message_on_last_step_keeps_agent_error(
+    domain_name: str,
+    user_simulator: UserSimulator,
+    agent: LLMAgent,
+    base_task: Task,
+    get_environment: Callable[[], Environment],
+):
+    """Test that an empty agent message on the last allowed step is not relabelled MAX_STEPS."""
+    from tau2.data_model.simulation import TerminationReason
+
+    orchestrator = Orchestrator(
+        domain=domain_name,
+        user=user_simulator,
+        agent=agent,
+        environment=get_environment(),
+        task=base_task,
+        max_steps=4,
+    )
+    orchestrator.initialize()
+
+    empty_message = AssistantMessage(role="assistant", content=None, cost=0.0)
+    orchestrator.agent.generate_next_message = lambda message, state: (
+        empty_message,
+        state,
+    )
+    # Hand the turn to the agent on the last step run() would allow.
+    orchestrator.from_role = Role.USER
+    orchestrator.to_role = Role.AGENT
+    orchestrator.step_count = orchestrator.max_steps - 1
+
+    # run() calls _check_termination() after every step, including the one that sets done.
+    orchestrator.step()
+    orchestrator._check_termination()
+
+    assert orchestrator.done is True
+    assert orchestrator.termination_reason == TerminationReason.AGENT_ERROR
+
+
+def test_empty_user_message_still_raises(
+    domain_name: str,
+    user_simulator: UserSimulator,
+    agent: LLMAgent,
+    base_task: Task,
+    get_environment: Callable[[], Environment],
+):
+    """Test that an empty user message remains an error, since it is an apparatus failure."""
+    orchestrator = Orchestrator(
+        domain=domain_name,
+        user=user_simulator,
+        agent=agent,
+        environment=get_environment(),
+        task=base_task,
+    )
+    orchestrator.initialize()
+
+    orchestrator.user.generate_next_message = lambda message, state: (
+        UserMessage(role="user", content=None, cost=0.0),
+        state,
+    )
+
+    with pytest.raises(
+        ValueError, match="UserMessage must have either content or tool_calls"
+    ):
+        orchestrator.step()
+
+
 def test_validate_communication_allows_valid_messages(
     domain_name: str,
     user_simulator: UserSimulator,
