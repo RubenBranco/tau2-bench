@@ -63,6 +63,16 @@ llm_log_mode: ContextVar[str] = ContextVar("llm_log_mode", default="latest")
 
 logging.getLogger("LiteLLM").setLevel(logging.WARNING)
 
+
+class ToolCallArgumentsError(ValueError):
+    """
+    Raised when a model returns tool call arguments that are not valid JSON.
+
+    Distinct from the JSONDecodeError litellm raises on a malformed response body, which is a
+    transport fault and must stay retryable.
+    """
+
+
 if USE_LANGFUSE:
     litellm.success_callback = ["langfuse"]
 else:
@@ -432,14 +442,21 @@ def generate(
     )
     content = response_choice.message.content
     raw_tool_calls = response_choice.message.tool_calls or []
-    tool_calls = [
-        ToolCall(
-            id=tool_call.id,
-            name=tool_call.function.name,
-            arguments=json.loads(tool_call.function.arguments),
+    tool_calls = []
+    for tool_call in raw_tool_calls:
+        try:
+            arguments = json.loads(tool_call.function.arguments)
+        except json.JSONDecodeError as e:
+            raise ToolCallArgumentsError(
+                f"Model returned invalid JSON arguments for tool {tool_call.function.name}: {e}"
+            ) from e
+        tool_calls.append(
+            ToolCall(
+                id=tool_call.id,
+                name=tool_call.function.name,
+                arguments=arguments,
+            )
         )
-        for tool_call in raw_tool_calls
-    ]
     tool_calls = tool_calls or None
 
     message = AssistantMessage(

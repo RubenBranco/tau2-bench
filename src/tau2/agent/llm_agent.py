@@ -5,6 +5,7 @@ from pydantic import BaseModel
 
 from tau2.agent.base.llm_config import LLMConfigMixin
 from tau2.agent.base_agent import (
+    AgentError,
     HalfDuplexAgent,
     ValidAgentInputMessage,
     is_valid_agent_history_message,
@@ -19,7 +20,7 @@ from tau2.data_model.message import (
 )
 from tau2.data_model.tasks import Action, Task
 from tau2.environment.tool import Tool, as_tool
-from tau2.utils.llm_utils import generate
+from tau2.utils.llm_utils import ToolCallArgumentsError, generate
 
 AGENT_INSTRUCTION = """
 You are a customer service agent that helps the user according to the <policy> provided below.
@@ -107,8 +108,16 @@ class LLMAgent(
     ) -> tuple[AssistantMessage, LLMAgentStateType]:
         """
         Respond to a user or tool message.
+
+        Raises:
+            AgentError: If the model returned tool call arguments that are not valid JSON.
+                This is a model failure, so the orchestrator ends the simulation instead of
+                retrying it.
         """
-        assistant_message = self._generate_next_message(message, state)
+        try:
+            assistant_message = self._generate_next_message(message, state)
+        except ToolCallArgumentsError as e:
+            raise AgentError(str(e)) from e
         state.messages.append(assistant_message)
         return assistant_message, state
 
@@ -243,19 +252,25 @@ class LLMGTAgent(
     ) -> tuple[AssistantMessage, LLMAgentStateType]:
         """
         Respond to a user or tool message.
+
+        Raises:
+            AgentError: If the model returned tool call arguments that are not valid JSON.
         """
         if isinstance(message, MultiToolMessage):
             state.messages.extend(message.tool_messages)
         else:
             state.messages.append(message)
         messages = state.system_messages + state.messages
-        assistant_message = generate(
-            model=self.llm,
-            tools=self.tools,
-            messages=messages,
-            call_name="agent_gt_response",
-            **self.llm_args,
-        )
+        try:
+            assistant_message = generate(
+                model=self.llm,
+                tools=self.tools,
+                messages=messages,
+                call_name="agent_gt_response",
+                **self.llm_args,
+            )
+        except ToolCallArgumentsError as e:
+            raise AgentError(str(e)) from e
         state.messages.append(assistant_message)
         return assistant_message, state
 
@@ -413,6 +428,8 @@ class LLMSoloAgent(
         """Check if the message is a stop message.
         If the message contains a tool call with the name STOP_FUNCTION_NAME, then the message is a stop message.
         """
+        if message.tool_calls is None:
+            return message
         is_stop = False
         for tool_call in message.tool_calls:
             if tool_call.name == self.STOP_FUNCTION_NAME:
@@ -456,6 +473,13 @@ class LLMSoloAgent(
     ) -> tuple[AssistantMessage, LLMAgentStateType]:
         """
         Respond to a user or tool message.
+
+        A message without tool calls violates the solo-mode protocol, but it is returned
+        rather than raised: the orchestrator ends such a simulation as an agent error, and
+        raising here would instead make it an infrastructure fault and retry it.
+
+        Raises:
+            AgentError: If the model returned tool call arguments that are not valid JSON.
         """
         if isinstance(message, UserMessage):
             raise ValueError("LLMSoloAgent does not support user messages.")
@@ -466,16 +490,17 @@ class LLMSoloAgent(
         else:
             state.messages.append(message)
         messages = state.system_messages + state.messages
-        assistant_message = generate(
-            model=self.llm,
-            tools=self.tools,
-            messages=messages,
-            tool_choice="required",
-            call_name="agent_solo_response",
-            **self.llm_args,
-        )
-        if not assistant_message.is_tool_call():
-            raise ValueError("LLMSoloAgent only supports tool calls.")
+        try:
+            assistant_message = generate(
+                model=self.llm,
+                tools=self.tools,
+                messages=messages,
+                tool_choice="required",
+                call_name="agent_solo_response",
+                **self.llm_args,
+            )
+        except ToolCallArgumentsError as e:
+            raise AgentError(str(e)) from e
         message = self._check_if_stop_toolcall(assistant_message)
         state.messages.append(assistant_message)
         return assistant_message, state

@@ -898,12 +898,17 @@ class Orchestrator(BaseOrchestrator[AgentT, UserT, Message]):
         elif (
             self.from_role == Role.USER or self.from_role == Role.ENV
         ) and self.to_role == Role.AGENT:
-            agent_msg, self.agent_state = self.agent.generate_next_message(
-                self.message, self.agent_state
-            )
+            # agent_msg stays bound for the handler even when generate_next_message raises.
+            agent_msg = None
             try:
-                agent_msg.validate()
-            except ValueError as exc:
+                agent_msg, self.agent_state = self.agent.generate_next_message(
+                    self.message, self.agent_state
+                )
+                try:
+                    agent_msg.validate()
+                except ValueError as exc:
+                    raise AgentError(str(exc)) from exc
+            except AgentError as exc:
                 self._end_as_agent_error(exc, message=agent_msg)
             else:
                 if self.agent.is_stop(agent_msg):
