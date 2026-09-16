@@ -736,7 +736,11 @@ class Orchestrator(BaseOrchestrator[AgentT, UserT, Message]):
         Check for half-duplex specific termination conditions.
 
         Only checks max_steps/max_errors/timeout when not waiting for environment response.
+        Returns immediately once the simulation is done: run() calls this after the step that
+        set the reason, and relabelling that reason MAX_STEPS would score a legitimate stop 0.
         """
+        if self.done:
+            return
         # Skip termination checks if we're waiting for environment to respond
         if self.to_role == Role.ENV:
             return

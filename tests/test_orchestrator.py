@@ -5,6 +5,7 @@ import pytest
 
 from tau2.agent.llm_agent import LLMAgent, LLMSoloAgent
 from tau2.data_model.message import AssistantMessage, UserMessage
+from tau2.data_model.simulation import TerminationReason
 from tau2.data_model.tasks import EnvAssertion, InitialState, Task
 from tau2.environment.environment import Environment
 from tau2.orchestrator.orchestrator import (
@@ -422,8 +423,6 @@ def test_validate_communication_catches_empty_message(
     get_environment: Callable[[], Environment],
 ):
     """Test that empty messages are caught when validation is enabled."""
-    from tau2.data_model.simulation import TerminationReason
-
     orchestrator = Orchestrator(
         domain=domain_name,
         user=user_simulator,
@@ -456,7 +455,6 @@ def test_validate_communication_catches_mixed_message(
 ):
     """Test that mixed messages (text + tool calls) are caught when validation is enabled."""
     from tau2.data_model.message import ToolCall
-    from tau2.data_model.simulation import TerminationReason
 
     orchestrator = Orchestrator(
         domain=domain_name,
@@ -486,6 +484,44 @@ def test_validate_communication_catches_mixed_message(
     assert orchestrator.termination_reason == TerminationReason.AGENT_ERROR
 
 
+def test_agent_stop_on_last_step_is_not_relabelled_max_steps(
+    domain_name: str,
+    user_simulator: UserSimulator,
+    agent: LLMAgent,
+    base_task: Task,
+    get_environment: Callable[[], Environment],
+):
+    """Test that a stop on the last allowed step keeps AGENT_STOP instead of MAX_STEPS."""
+    orchestrator = Orchestrator(
+        domain=domain_name,
+        user=user_simulator,
+        agent=agent,
+        environment=get_environment(),
+        task=base_task,
+        max_steps=4,
+    )
+    orchestrator.initialize()
+
+    stop_message = AssistantMessage(role="assistant", content="###STOP###", cost=0.0)
+    orchestrator.agent.generate_next_message = lambda message, state: (
+        stop_message,
+        state,
+    )
+    orchestrator.agent.is_stop = lambda message: message is stop_message
+    # Hand the turn to the agent on the last step run() would allow.
+    orchestrator.from_role = Role.USER
+    orchestrator.to_role = Role.AGENT
+    orchestrator.step_count = orchestrator.max_steps - 1
+
+    # run() calls _check_termination() after every step, including the one that sets done.
+    orchestrator.step()
+    orchestrator._check_termination()
+
+    assert orchestrator.step_count == orchestrator.max_steps
+    assert orchestrator.done is True
+    assert orchestrator.termination_reason == TerminationReason.AGENT_STOP
+
+
 def test_empty_agent_message_terminates_with_agent_error(
     domain_name: str,
     user_simulator: UserSimulator,
@@ -494,8 +530,6 @@ def test_empty_agent_message_terminates_with_agent_error(
     get_environment: Callable[[], Environment],
 ):
     """Test that an empty agent message ends the simulation instead of raising."""
-    from tau2.data_model.simulation import TerminationReason
-
     orchestrator = Orchestrator(
         domain=domain_name,
         user=user_simulator,
@@ -532,8 +566,6 @@ def test_empty_agent_message_on_last_step_keeps_agent_error(
     get_environment: Callable[[], Environment],
 ):
     """Test that an empty agent message on the last allowed step is not relabelled MAX_STEPS."""
-    from tau2.data_model.simulation import TerminationReason
-
     orchestrator = Orchestrator(
         domain=domain_name,
         user=user_simulator,

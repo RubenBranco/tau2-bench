@@ -528,7 +528,11 @@ class FullDuplexOrchestrator(BaseOrchestrator[StreamingAgentT, StreamingUserT, T
         Check for full-duplex specific termination conditions.
 
         Checks max_steps, max_errors, and timeout after each tick.
+        Returns immediately once the simulation is done: run() calls this after the step that
+        set the reason, and relabelling that reason MAX_STEPS would score a legitimate stop 0.
         """
+        if self.done:
+            return
         if self.step_count >= self.max_steps:
             self.done = True
             self.termination_reason = TerminationReason.MAX_STEPS
