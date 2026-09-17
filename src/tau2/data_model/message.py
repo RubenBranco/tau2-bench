@@ -314,7 +314,7 @@ class ParticipantMessageBase(BaseModel):
         """
         Check if the message is a tool call.
         """
-        return self.tool_calls is not None
+        return bool(self.tool_calls)
 
     def get_audio_bytes(self) -> Optional[bytes]:
         """

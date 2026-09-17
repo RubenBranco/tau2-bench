@@ -48,6 +48,34 @@ DEFAULT_FIRST_AGENT_MESSAGE = AssistantMessage(
     role="assistant", content="Hi! How can I help you today?", cost=0.0
 )
 
+# A failed agent turn labelled with one of these is the provider's fault rather than the
+# model's, so the episode is retried instead of scored. Every other label is charged to the
+# model: endpoints label a large share of ordinary turns "tool_calls", so retrying unless the
+# label is known-good would re-roll the most likely degenerate case.
+RETRYABLE_FINISH_REASONS = frozenset({"content_filter"})
+
+
+def get_finish_reason(message: Optional[AssistantMessage]) -> Optional[str]:
+    """
+    Get the provider's finish_reason for a generated message.
+
+    Callers run this from an exception handler, so an unrecognised raw_data shape must yield
+    None rather than raise: a new exception there would escape as an infrastructure fault and
+    turn a charged turn back into a retry.
+
+    Returns:
+        The finish_reason, or None when the message carries no readable provider response.
+        raw_data is absent for GymAgent, custom agents and hand-built messages, and a provider
+        can answer with an empty choices list.
+    """
+    raw_data = message.raw_data if message is not None else None
+    choices = (raw_data or {}).get("choices")
+    if not isinstance(choices, list) or not choices:
+        return None
+    choice = choices[0]
+    return choice.get("finish_reason") if isinstance(choice, dict) else None
+
+
 # Type variables for generic orchestrators
 # Base types for BaseOrchestrator - unbound to allow both half-duplex and full-duplex
 BaseAgentT = TypeVar("BaseAgentT")
@@ -221,6 +249,26 @@ class BaseOrchestrator(ABC, Generic[BaseAgentT, BaseUserT, TrajectoryItemT]):
         """
         pass
 
+    def _terminate(
+        self, reason: TerminationReason, detail: Optional[str] = None
+    ) -> None:
+        """
+        End the simulation with the given termination reason.
+
+        The base orchestrator owns no trajectory or routing state, so a subclass that needs
+        to record the offending message must do that before calling this.
+
+        Args:
+            reason: The termination reason to record.
+            detail: Optional explanation to include in the log line.
+        """
+        self.done = True
+        self.termination_reason = reason
+        log_line = f"Ending simulation: {reason.value}"
+        if detail is not None:
+            log_line = f"{log_line}. {detail}"
+        logger.info(log_line)
+
     def _check_timeout(self) -> None:
         if (
             self.timeout is not None
@@ -388,7 +436,8 @@ class Orchestrator(BaseOrchestrator[AgentT, UserT, Message]):
             - User sends stop signal
             - Maximum steps (max_steps) reached
             - Maximum errors (max_errors) reached
-            - Communication protocol violation detected (if validate_communication=True)
+            - Agent breaks the message content rules, or sends text to the user in solo mode
+            - Any other communication protocol violation detected (if validate_communication=True)
     """
 
     def __init__(
@@ -638,30 +687,31 @@ class Orchestrator(BaseOrchestrator[AgentT, UserT, Message]):
                 self.to_role = Role.USER
             else:
                 self.agent_state = self.agent.get_init_state()
-                first_message, self.agent_state = self.agent.generate_next_message(
-                    None, self.agent_state
-                )
-                self.trajectory = [first_message]
-                self.message = first_message
-                # In solo mode, there is no user, so if the message is not a tool call, then we end and report an agent error
-                if not first_message.is_tool_call():
-                    self.from_role = Role.AGENT
-                    self.to_role = Role.USER
-                    self.done = True
-                    if self.agent.is_stop(first_message):
-                        # If the agent is stopping (###STOP###)
-                        self.termination_reason = TerminationReason.AGENT_STOP
+                # The agent's first solo turn goes through the same gate as every later one,
+                # so a provider fault here is retried rather than scored 0.
+                first_message = self._generate_agent_turn(None)
+                if first_message is not None:
+                    self.trajectory = [first_message]
+                    self.message = first_message
+                    # In solo mode, there is no user, so if the message is not a tool call, then we end and report an agent error
+                    if not first_message.is_tool_call():
+                        self.from_role = Role.AGENT
+                        self.to_role = Role.USER
+                        self.done = True
+                        if self.agent.is_stop(first_message):
+                            # If the agent is stopping (###STOP###)
+                            self.termination_reason = TerminationReason.AGENT_STOP
+                        else:
+                            self.termination_reason = TerminationReason.AGENT_ERROR
                     else:
-                        self.termination_reason = TerminationReason.AGENT_ERROR
-                else:
-                    self.from_role = Role.AGENT
-                    self.to_role = Role.ENV
-                    self.done = self.agent.is_stop(first_message)
-                    if self.done:
-                        self.to_role = Role.USER  # FIXIT: For now, we assume last message cannot be to the environment
-                        self.termination_reason = TerminationReason.AGENT_STOP
+                        self.from_role = Role.AGENT
+                        self.to_role = Role.ENV
+                        self.done = self.agent.is_stop(first_message)
+                        if self.done:
+                            self.to_role = Role.USER  # FIXIT: For now, we assume last message cannot be to the environment
+                            self.termination_reason = TerminationReason.AGENT_STOP
 
-        if self.validate_communication:
+        if self.validate_communication and not self.done:
             self.check_communication_error()
         self.environment.sync_tools()
 
@@ -677,19 +727,15 @@ class Orchestrator(BaseOrchestrator[AgentT, UserT, Message]):
         When a communication error is detected:
         - Sets `self.done = True` to terminate the simulation
         - Sets `self.termination_reason` to either `AGENT_ERROR` or `USER_ERROR`
-        - Re-raises any other exceptions that are not communication-related
+
+        Any other exception propagates to the caller.
         """
         try:
             self._check_communication_error()
-        except AgentError:
-            self.done = True
-            self.termination_reason = TerminationReason.AGENT_ERROR
-        except UserError:
-            self.done = True
-            self.termination_reason = TerminationReason.USER_ERROR
-        except Exception:
-            # Re-raise all other exceptions
-            raise
+        except AgentError as exc:
+            self._terminate(TerminationReason.AGENT_ERROR, str(exc))
+        except UserError as exc:
+            self._terminate(TerminationReason.USER_ERROR, str(exc))
 
     def _check_communication_error(self) -> None:
         """
@@ -731,12 +777,92 @@ class Orchestrator(BaseOrchestrator[AgentT, UserT, Message]):
                     f"{self.from_role.value} can only send tool calls. {self.message}"
                 )
 
+    def _end_as_agent_error(
+        self, exc: Exception, message: Optional[AssistantMessage] = None
+    ) -> None:
+        """
+        End the simulation with AGENT_ERROR, recording the offending message if there is one.
+
+        Args:
+            exc: The failure that ends the simulation.
+            message: The agent message that caused it, when the agent produced one. When it is
+                None the routing state is left alone, so `_finalize()` still hands the pending
+                message to the participant it was addressed to.
+        """
+        if message is not None:
+            self.trajectory.append(message)
+            self.message = message
+            self.from_role = Role.AGENT
+            self.to_role = Role.USER
+        self._terminate(TerminationReason.AGENT_ERROR, str(exc))
+
+    def _charge_or_reraise(
+        self, exc: AgentError, message: Optional[AssistantMessage]
+    ) -> None:
+        """
+        Charge a failed agent turn to the model, or leave it for the caller to retry.
+
+        Args:
+            exc: The failure that ended the turn.
+            message: The agent message that failed, when the agent produced one.
+
+        Raises:
+            AgentError: Re-raised when the provider labelled the turn a fault of its own, so
+                that `run_with_retry()` gives the model a fresh draw.
+        """
+        finish_reason = get_finish_reason(message)
+        if finish_reason in RETRYABLE_FINISH_REASONS:
+            logger.warning(
+                f"Agent turn failed with finish_reason={finish_reason}, "
+                f"leaving it to the caller to retry: {exc}"
+            )
+            raise exc
+        logger.warning(
+            f"Agent turn failed with finish_reason={finish_reason}, "
+            f"charging it to the agent: {exc}"
+        )
+        self._end_as_agent_error(exc, message=message)
+
+    def _generate_agent_turn(
+        self, message: Optional[Message]
+    ) -> Optional[AssistantMessage]:
+        """
+        Run one agent turn, validating its message and gating a failure.
+
+        Args:
+            message: The message the agent is responding to, None for the first solo turn.
+
+        Returns:
+            The agent's message, or None when the turn failed and was charged to the agent.
+
+        Raises:
+            AgentError: When `_charge_or_reraise()` leaves the turn for the caller to retry.
+        """
+        # agent_msg stays bound for the handler even when generate_next_message raises.
+        agent_msg = None
+        try:
+            agent_msg, self.agent_state = self.agent.generate_next_message(
+                message, self.agent_state
+            )
+            try:
+                agent_msg.validate()
+            except ValueError as exc:
+                raise AgentError(str(exc)) from exc
+        except AgentError as exc:
+            self._charge_or_reraise(exc, agent_msg)
+            return None
+        return agent_msg
+
     def _check_termination(self) -> None:
         """
         Check for half-duplex specific termination conditions.
 
         Only checks max_steps/max_errors/timeout when not waiting for environment response.
+        Returns immediately once the simulation is done: run() calls this after the step that
+        set the reason, and relabelling that reason MAX_STEPS would score a legitimate stop 0.
         """
+        if self.done:
+            return
         # Skip termination checks if we're waiting for environment to respond
         if self.to_role == Role.ENV:
             return
@@ -827,6 +953,13 @@ class Orchestrator(BaseOrchestrator[AgentT, UserT, Message]):
         Sends self.message from self.from_role to self.to_role.
         This can either be a message from agent to user/environment, environment to agent,
         or user to agent. Updates self.trajectory.
+
+        A model-output failure on the agent's turn (an empty message, malformed tool call
+        arguments) ends the simulation with AGENT_ERROR, which scores the task 0, unless the
+        provider labelled the turn a fault of its own (see RETRYABLE_FINISH_REASONS). The same
+        failure on the user's turn is left to propagate so the caller retries the episode: the
+        user simulator is measurement apparatus rather than the system under test, so its
+        failures must not be charged to the agent.
         """
         if self.done:
             raise ValueError("Simulation is done")
@@ -859,25 +992,25 @@ class Orchestrator(BaseOrchestrator[AgentT, UserT, Message]):
         elif (
             self.from_role == Role.USER or self.from_role == Role.ENV
         ) and self.to_role == Role.AGENT:
-            agent_msg, self.agent_state = self.agent.generate_next_message(
-                self.message, self.agent_state
-            )
-            agent_msg.validate()
-            if self.agent.is_stop(agent_msg):
-                self.done = True
-                self.termination_reason = TerminationReason.AGENT_STOP
-
-            self.trajectory.append(agent_msg)
-            self.message = agent_msg
-            self.from_role = Role.AGENT
-            if agent_msg.is_tool_call():
-                self.to_role = Role.ENV
-            else:
-                self.to_role = Role.USER
-                # In solo mode, there is no user, so if the message is not a tool call and not a stop, then we end and report an agent error
-                if self.solo_mode and not self.agent.is_stop(agent_msg):
+            agent_msg = self._generate_agent_turn(self.message)
+            if agent_msg is not None:
+                if self.agent.is_stop(agent_msg):
                     self.done = True
-                    self.termination_reason = TerminationReason.AGENT_ERROR
+                    self.termination_reason = TerminationReason.AGENT_STOP
+
+                self.trajectory.append(agent_msg)
+                self.message = agent_msg
+                self.from_role = Role.AGENT
+                if agent_msg.is_tool_call():
+                    self.to_role = Role.ENV
+                else:
+                    self.to_role = Role.USER
+                    # In solo mode, there is no user, so if the message is not a tool call and not a stop, then we end and report an agent error
+                    if self.solo_mode and not self.agent.is_stop(agent_msg):
+                        self._terminate(
+                            TerminationReason.AGENT_ERROR,
+                            f"agent can only send tool calls. {agent_msg}",
+                        )
         # AGENT/USER -> ENV
         elif self.from_role in [Role.AGENT, Role.USER] and self.to_role == Role.ENV:
             if not self.message.is_tool_call():
@@ -894,7 +1027,10 @@ class Orchestrator(BaseOrchestrator[AgentT, UserT, Message]):
             raise ValueError(
                 f"Invalid role combination. From role: {self.from_role}, To role: {self.to_role}"
             )
-        if self.validate_communication:
+        # Skipped once this step has already set a termination reason: the checks read
+        # self.message, which on the agent-error path is still the other participant's
+        # message, so they would relabel an AGENT_ERROR as USER_ERROR.
+        if self.validate_communication and not self.done:
             self.check_communication_error()
         self.step_count += 1
         self.environment.sync_tools()
