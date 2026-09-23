@@ -197,13 +197,30 @@ def to_litellm_messages(messages: list[Message]) -> list[dict]:
                     }
                     for tc in message.tool_calls
                 ]
-            litellm_messages.append(
-                {
-                    "role": "assistant",
-                    "content": message.content,
-                    "tool_calls": tool_calls,
-                }
-            )
+            litellm_message = {
+                "role": "assistant",
+                "content": message.content,
+                "tool_calls": tool_calls,
+            }
+            # Replay the model's own reasoning from its stored response: chat templates decide
+            # what to render (e.g. GLM's `clear_thinking`), and Anthropic tool loops need their
+            # thinking blocks back. Messages tau2 builds itself carry no LiteLLM response.
+            if message.raw_data:
+                response_message = (message.raw_data.get("choices") or [{}])[0].get(
+                    "message", {}
+                )
+                if response_message.get("reasoning_content"):
+                    # vLLM reads history reasoning only from `reasoning`, SGLang only from
+                    # `reasoning_content`.
+                    litellm_message["reasoning_content"] = response_message[
+                        "reasoning_content"
+                    ]
+                    litellm_message["reasoning"] = response_message["reasoning_content"]
+                if response_message.get("thinking_blocks"):
+                    litellm_message["thinking_blocks"] = response_message[
+                        "thinking_blocks"
+                    ]
+            litellm_messages.append(litellm_message)
         elif isinstance(message, ToolMessage):
             litellm_messages.append(
                 {

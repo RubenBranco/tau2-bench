@@ -15,7 +15,11 @@ from tau2.data_model.message import (
     UserMessage,
 )
 from tau2.environment.tool import Tool, as_tool
-from tau2.utils.llm_utils import ToolCallArgumentsError, generate
+from tau2.utils.llm_utils import (
+    ToolCallArgumentsError,
+    generate,
+    to_litellm_messages,
+)
 
 
 @pytest.fixture
@@ -119,3 +123,56 @@ def test_generate_raises_on_invalid_tool_call_arguments(
     # the JSONDecodeError litellm raises on a malformed response body.
     with pytest.raises(ToolCallArgumentsError):
         generate(model, tool_call_messages, tools=[tool])
+
+
+THINKING_BLOCKS = [{"type": "thinking", "thinking": "Square 5.", "signature": "sig"}]
+
+
+@pytest.mark.parametrize(
+    "reasoning_fields, replayed_fields",
+    [
+        (
+            {"reasoning_content": "Square 5."},
+            {"reasoning_content": "Square 5.", "reasoning": "Square 5."},
+        ),
+        ({"thinking_blocks": THINKING_BLOCKS}, {"thinking_blocks": THINKING_BLOCKS}),
+    ],
+)
+def test_generated_reasoning_is_replayed(
+    model: str,
+    tool_call_messages: list[Message],
+    tool: Tool,
+    monkeypatch: pytest.MonkeyPatch,
+    reasoning_fields: dict,
+    replayed_fields: dict,
+):
+    """The agent's own reasoning goes back to the model with its assistant turn."""
+    response = ModelResponse(
+        model=model,
+        choices=[
+            Choices(
+                index=0,
+                finish_reason="stop",
+                message=LiteLLMMessage(
+                    role="assistant", content="25", **reasoning_fields
+                ),
+            )
+        ],
+    )
+    monkeypatch.setattr("tau2.utils.llm_utils.completion", lambda **kwargs: response)
+    assistant_message = generate(model, tool_call_messages, tools=[tool])
+
+    replayed = to_litellm_messages([assistant_message])[0]
+
+    assert {
+        k: v for k, v in replayed.items() if k not in ("role", "content", "tool_calls")
+    } == replayed_fields
+
+
+@pytest.mark.parametrize("raw_data", [None, {"action": "respond"}])
+def test_message_without_litellm_response_is_replayed_as_is(raw_data: dict | None):
+    message = AssistantMessage(role="assistant", content="Hi!", raw_data=raw_data)
+
+    assert to_litellm_messages([message]) == [
+        {"role": "assistant", "content": "Hi!", "tool_calls": None}
+    ]
